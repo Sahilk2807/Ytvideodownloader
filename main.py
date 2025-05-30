@@ -10,10 +10,22 @@ API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
+# Create downloads folder if it doesn't exist
+if not os.path.exists("downloads"):
+    os.makedirs("downloads")
+
 app = Client("youtube_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # Store cookies file path here if uploaded
 cookies_path = None
+
+def sizeof_fmt(num, suffix="B"):
+    # Converts bytes to human readable format (e.g. 2.3 MB)
+    for unit in ["", "K", "M", "G", "T", "P", "E", "Z"]:
+        if abs(num) < 1024.0:
+            return f"{num:3.1f} {unit}{suffix}"
+        num /= 1024.0
+    return f"{num:.1f} Y{suffix}"
 
 @app.on_message(filters.command("start"))
 async def start_handler(client, message):
@@ -40,10 +52,8 @@ async def download_video(client, message):
     if not url.startswith("http"):
         return await message.reply_text("⚠️ Please send a valid YouTube URL!")
 
-    # Show "typing" animation
     await client.send_chat_action(message.chat.id, enums.ChatAction.TYPING)
 
-    # Step 1: Extract available formats to show quality options
     ydl_opts_info = {
         'quiet': True,
         'skip_download': True,
@@ -57,36 +67,24 @@ async def download_video(client, message):
     except Exception as e:
         return await message.reply(f"❌ Extraction error: {str(e)}")
 
-    # Prepare buttons for available video formats
     formats = [f for f in info.get("formats", []) if f.get("filesize") and f.get("ext") == "mp4" and f.get("vcodec") != "none"]
-    # Filter unique resolutions and sort by height ascending
     unique_formats = {}
     for f in formats:
         res = f.get("height")
         if res and res not in unique_formats:
             unique_formats[res] = f
 
-    # Sort formats by resolution
     sorted_formats = sorted(unique_formats.items(), key=lambda x: x[0])
 
-    # Build buttons
-    buttons = []
-    for res, f in sorted_formats:
-        buttons.append([f"{res}p"])
-
-    # Save info and formats for callback query (can use a dict, but here simple cache)
-    # Store formats in message reply_markup for callback usage
-    # We'll keep formats info in-memory keyed by message id
     app.formats_cache = getattr(app, "formats_cache", {})
     app.formats_cache[message.message_id] = sorted_formats
 
-    # Send message with quality options
     keyboard = [[
         {
-            "text": f"{res}p",
+            "text": f"{res}p ({sizeof_fmt(f.get('filesize', 0))})",
             "callback_data": f"download_{message.message_id}_{res}"
         }
-    ] for res, _ in sorted_formats]
+    ] for res, f in sorted_formats]
 
     await message.reply(
         f"🎬 *{info.get('title', 'Video')}*\n\nChoose download quality:",
@@ -103,12 +101,10 @@ async def on_quality_selected(client, callback_query):
     _, msg_id, res_str = data.split("_")
     res = int(res_str)
 
-    # Get formats stored
     formats = app.formats_cache.get(int(msg_id))
     if not formats:
         return await callback_query.answer("❌ Session expired, please send the URL again.", show_alert=True)
 
-    # Find chosen format
     chosen_format = None
     for height, f in formats:
         if height == res:
@@ -122,18 +118,33 @@ async def on_quality_selected(client, callback_query):
     if not video_url:
         return await callback_query.answer("❌ Cannot find video URL.", show_alert=True)
 
-    # Inform user about download start
     await callback_query.answer(f"⏳ Downloading {res}p...", show_alert=False)
+    await client.send_chat_action(callback_query.message.chat.id, enums.ChatAction.UPLOAD_VIDEO)
 
-    # Show upload animation
-    await client.send_chat_action(callback_query.message.chat.id, "upload_video")
+    progress_msg = await callback_query.message.edit(f"⏳ Starting download of {res}p...")
 
-    # Download video with chosen format
+    def progress_hook(d):
+        if d['status'] == 'downloading':
+            total_bytes = d.get('total_bytes') or d.get('total_bytes_estimate')
+            downloaded_bytes = d.get('downloaded_bytes', 0)
+            percent = downloaded_bytes / total_bytes * 100 if total_bytes else 0
+            progress_text = (
+                f"⏳ Downloading {res}p...\n"
+                f"{percent:.1f}% of {sizeof_fmt(total_bytes)}"
+            )
+            now = asyncio.get_event_loop().time()
+            if not hasattr(progress_hook, "last_edit") or now - progress_hook.last_edit > 2:
+                asyncio.create_task(progress_msg.edit(progress_text))
+                progress_hook.last_edit = now
+        elif d['status'] == 'finished':
+            asyncio.create_task(progress_msg.edit("✅ Download finished, uploading now..."))
+
     ydl_opts = {
         'format': f"{chosen_format['format_id']}",
         'outtmpl': 'downloads/%(title)s.%(ext)s',
         'quiet': True,
         'cookiefile': cookies_path,
+        'progress_hooks': [progress_hook],
     }
 
     try:
@@ -143,13 +154,22 @@ async def on_quality_selected(client, callback_query):
     except Exception as e:
         return await callback_query.message.edit(f"❌ Download failed: {str(e)}")
 
-    # Send video
+    async def upload_progress(current, total):
+        percent = current / total * 100
+        await progress_msg.edit(f"📤 Uploading video... {percent:.1f}%")
+
     try:
-        await callback_query.message.edit("📤 Uploading video...")
-        await client.send_video(callback_query.message.chat.id, file_path, caption=info.get("title", "🎬 Your video"))
+        await client.send_video(
+            callback_query.message.chat.id,
+            file_path,
+            caption=info.get("title", "🎬 Your video"),
+            progress=upload_progress,
+            progress_args=(),
+        )
         os.remove(file_path)
-        await callback_query.message.delete_reply_markup()
+        await progress_msg.delete_reply_markup()
+        await progress_msg.edit("✅ Upload completed!")
     except Exception as e:
-        await callback_query.message.edit(f"❌ Upload failed: {str(e)}")
+        await progress_msg.edit(f"❌ Upload failed: {str(e)}")
 
 app.run()
