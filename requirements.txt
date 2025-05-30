@@ -1,4 +1,3 @@
-pyrogram==2.0.106
-tgcrypto
+pyrogram
 yt-dlp
 python-dotenv
